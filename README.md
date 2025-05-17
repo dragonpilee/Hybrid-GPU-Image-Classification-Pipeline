@@ -84,7 +84,7 @@ pip install torch torchvision fastai numba
 ## 🧪 How to Run
 
 ```bash
-git clone https://github.com/yourusername/hybrid-gpu-classifier.git
+https://github.com/dragonpilee/Hybrid-GPU-Image-Classification-Pipeline.git
 cd hybrid-gpu-classifier
 python train.py
 ```
