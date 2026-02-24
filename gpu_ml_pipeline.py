@@ -4,81 +4,90 @@ import cupy as cp
 import numpy as np
 from numba import cuda
 from fastai.vision.all import *
+from torch.utils.dlpack import to_dlpack, from_dlpack
 
-print("🚀 Starting Hybrid GPU Image Classification Pipeline")
+print("🚀 Starting Optimized Hybrid GPU Image Classification Pipeline")
 
 # Check device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-# Load dataset (CIFAR-10) with fastai DataLoaders
-batch_size = 128
-dls = ImageDataLoaders.from_folder(
-    untar_data(URLs.CIFAR),
-    train='train',
-    valid='test',
-    bs=batch_size,
-    item_tfms=Resize(32),
-    device=device
-)
-print(f"Dataset loaded with batch size {batch_size}")
+# --- GPU KERNELS & UTILS ---
 
-# CuPy normalization function
-def gpu_normalize_images(images):
-    # images shape (bs, ch, h, w), float32 assumed in range [0,1]
-    images_cp = cp.asarray(images)
-    mean = cp.array([0.4914, 0.4822, 0.4465], dtype=cp.float32).reshape(3,1,1)
-    std = cp.array([0.247, 0.243, 0.261], dtype=cp.float32).reshape(3,1,1)
-    normalized = (images_cp - mean) / std
-    return cp.asnumpy(normalized)
+def torch_to_cupy(t):
+    return cp.from_dlpack(to_dlpack(t))
 
-# Numba GPU kernel for brightness augmentation
+def cupy_to_torch(c):
+    return from_dlpack(c.toDlpack())
+
 @cuda.jit
 def brightness_kernel(images, brightness_factor):
     idx = cuda.grid(1)
-    size = images.size
-    if idx < size:
+    if idx < images.size:
         images[idx] = min(images[idx] * brightness_factor, 1.0)
 
-def gpu_brightness_augment(images):
-    # images shape (bs, ch, h, w)
-    images_cp = cp.asarray(images)
-    brightness_factor = 1.2  # Increase brightness by 20%
-    flat = images_cp.ravel()
-    threads_per_block = 256
-    blocks = (flat.size + threads_per_block - 1) // threads_per_block
-    brightness_kernel[blocks, threads_per_block](flat, brightness_factor)
-    return cp.asnumpy(images_cp)
+@cuda.jit
+def salt_pepper_kernel(images, prob, seed):
+    idx = cuda.grid(1)
+    if idx < images.size:
+        # Simple pseudo-random logic for noise
+        res = (idx * 1103515245 + 12345 + seed) & 0x7fffffff
+        random_val = res / 0x7fffffff
+        if random_val < prob / 2:
+            images[idx] = 0.0
+        elif random_val < prob:
+            images[idx] = 1.0
 
-# Preprocess batch with GPU acceleration steps
-def preprocess_batch(batch):
-    imgs, labels = batch
-    # Move images to CPU and convert to numpy
-    imgs_np = imgs.cpu().numpy()
-    # Normalize on GPU with CuPy
-    imgs_np = gpu_normalize_images(imgs_np)
-    # Brightness augmentation on GPU with Numba
-    imgs_np = gpu_brightness_augment(imgs_np)
-    # Convert back to tensor and send to device
-    imgs_tensor = torch.tensor(imgs_np).float().to(device)
-    return imgs_tensor, labels
+class GPUPipelineTransform(Transform):
+    def __init__(self, brightness=1.2, noise_prob=0.02):
+        self.brightness = brightness
+        self.noise_prob = noise_prob
+        self.mean = cp.array([0.4914, 0.4822, 0.4465], dtype=cp.float32).reshape(1,3,1,1)
+        self.std = cp.array([0.247, 0.243, 0.261], dtype=cp.float32).reshape(1,3,1,1)
 
-# Define a simple CNN model with FastAI
-def get_model():
-    learn = vision_learner(dls, resnet18, metrics=accuracy)
-    return learn
+    def encodes(self, b):
+        if not isinstance(b, tuple) or len(b) != 2: return b
+        imgs, labels = b
+        if not imgs.is_cuda: return b
 
-# Train the model with preprocessing
+        # Zero-copy share with CuPy
+        imgs_cp = torch_to_cupy(imgs)
+
+        # 1. Normalization
+        imgs_cp = (imgs_cp - self.mean) / self.std
+
+        # 2. Brightness Kernel
+        flat = imgs_cp.ravel()
+        threads = 256
+        blocks = (flat.size + threads - 1) // threads
+        brightness_kernel[blocks, threads](flat, self.brightness)
+
+        # 3. Noise Kernel
+        salt_pepper_kernel[blocks, threads](flat, self.noise_prob, int(time.time()))
+
+        return cupy_to_torch(imgs_cp), labels
+
+# --- MAIN SETUP ---
+
+# Load dataset (CIFAR-10)
+path = untar_data(URLs.CIFAR)
+dls = ImageDataLoaders.from_folder(
+    path, train='train', valid='test', 
+    bs=128, item_tfms=Resize(32),
+    batch_tfms=[IntToFloatTensor(), GPUPipelineTransform()],
+    device=device
+)
+
 def train_model():
-    learn = get_model()
-    print("Preprocessing sample batch with GPU kernels...")
-    batch = dls.one_batch()
-    x, y = preprocess_batch(batch)  # Preprocess a sample batch to check
-    print("Starting training...")
+    learn = vision_learner(dls, resnet18, metrics=accuracy).to_fp16()
+    print("Starting optimized training (Mixed Precision + Zero-Copy GPU Preprocessing)...")
+    
     start = time.time()
-    learn.fit_one_cycle(1)
+    # Using small number of epochs for demo
+    learn.fit_one_cycle(1, 1e-3)
     end = time.time()
-    print(f"✅ FastAI training completed\n⏱️ Time: {end - start:.2f} sec")
+    
+    print(f"✅ Training completed in {end - start:.2f} sec")
 
 if __name__ == '__main__':
     train_model()

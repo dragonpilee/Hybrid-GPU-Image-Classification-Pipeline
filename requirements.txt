@@ -1,0 +1,3 @@
+fastai
+cupy-cuda12x
+numba
